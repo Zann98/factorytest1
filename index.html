@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>FactoryOS — Production Management</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, GoogleAuthProvider, signInWithRedirect, getRedirectResult, signOut, onAuthStateChanged }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, addDoc, getDocs, setDoc, doc, deleteDoc, query, orderBy, serverTimestamp, onSnapshot }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCj31l-mo-lqcJx8hvyncz87JaLw-AQmow",
+  authDomain: "factory-d6da2.firebaseapp.com",
+  projectId: "factory-d6da2",
+  storageBucket: "factory-d6da2.firebasestorage.app",
+  messagingSenderId: "109772030231",
+  appId: "1:109772030231:web:2d513ca5e752cfebc83752",
+  measurementId: "G-H2Q9JWLGLP"
+};
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+
+// Handle redirect result when user comes back from Google
+getRedirectResult(auth).then(result=>{
+  if(result && result.user){
+    console.log('Signed in via redirect:', result.user.email);
+  }
+}).catch(e=>{
+  console.warn('Redirect result:', e.code, e.message);
+  if(e.code === 'auth/unauthorized-domain'){
+    const btn=document.getElementById('signin-btn');
+    if(btn){ btn.disabled=false; btn.innerHTML='Sign in with Google'; }
+    document.getElementById('auth-error').textContent =
+      'Error: Your domain is not authorized in Firebase. Go to Firebase Console → Authentication → Settings → Authorized Domains and add: ' + window.location.hostname;
+    document.getElementById('auth-error').style.display='block';
+  }
+});
+
+function uCol(uid,c){ return collection(db,'users',uid,c); }
+function uDoc(uid,c,id){ return doc(db,'users',uid,c,id); }
+function ts(){ return new Date().toTimeString().slice(0,8); }
+function dateStr(){ return new Date().toLocaleDateString('en-MY',{day:'2-digit',month:'short',year:'numeric'}); }
+
+// ── AUTH ─────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  if(user){
+    document.getElementById('login-screen').style.display='none';
+    document.getElementById('app').style.display='flex';
+    document.getElementById('u-name').textContent = user.displayName||user.email;
+    document.getElementById('u-email').textContent = user.email;
+    const av=document.getElementById('u-av');
+    if(user.photoURL){ av.style.backgroundImage=`url(${user.photoURL})`; av.style.backgroundSize='cover'; av.textContent=''; }
+    else av.textContent=(user.displayName||'?')[0].toUpperCase();
+    window._uid=user.uid; window._uname=user.displayName||user.email;
+    loadAll(user.uid);
+    setInterval(()=>{ const e=document.getElementById('clock'); if(e) e.textContent=new Date().toLocaleTimeString('en-MY',{hour:'2-digit',minute:'2-digit',second:'2-digit'}); },1000);
+  } else {
+    document.getElementById('login-screen').style.display='flex';
+    document.getElementById('app').style.display='none';
+    window._uid=null;
+  }
+});
+
+window.signInGoogle = async()=>{
+  const btn=document.getElementById('signin-btn');
+  const errEl=document.getElementById('auth-error');
+  btn.innerHTML='<div class="spinner"></div> Redirecting to Google…';
+  btn.disabled=true;
+  if(errEl) errEl.style.display='none';
+  try{
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    await signInWithRedirect(auth, provider);
+  } catch(e){
+    btn.innerHTML='Sign in with Google';
+    btn.disabled=false;
+    if(errEl){ errEl.textContent='Error: '+e.message; errEl.style.display='block'; }
+  }
+};
+window.signOutUser=()=>signOut(auth);
+
+// ── LOAD ALL ─────────────────────────────────────────
+async function loadAll(uid){
+  await Promise.all([
+    load(uid,'machines',   window.machines=[]),
+    load(uid,'waste',      window.wastes=[],   'createdAt'),
+    load(uid,'workers',    window.workers=[],  'createdAt'),
+    load(uid,'sessions',   window.sessions=[], 'createdAt'),
+    load(uid,'deliveries', window.deliveries=[],'createdAt'),
+    load(uid,'parts',      window.parts=[],    'createdAt'),
+    load(uid,'sales',      window.sales=[],    'createdAt'),
+    load(uid,'logistics',  window.logistics=[],'createdAt'),
+    load(uid,'customers',  window.customers=[],'createdAt'),
+    load(uid,'resources',  window.resources=[],'createdAt'),
+    load(uid,'mfgschedule',window.mfgsched=[], 'createdAt'),
+    load(uid,'log',        window.logs=[],     'createdAt'),
+  ]);
+  if(!window.machines.length) await seedMachines(uid);
+  subscribeSales(uid);
+  subscribeLogistics(uid);
+  renderAll(); updateKPIs();
+}
+
+async function load(uid,col,arr,orderField){
+  try{
+    const snap = orderField
+      ? await getDocs(query(uCol(uid,col),orderBy(orderField,'desc')))
+      : await getDocs(uCol(uid,col));
+    arr.length=0;
+    snap.docs.forEach(d=>arr.push({_id:d.id,...d.data()}));
+  } catch(e){ console.warn('load error',col,e); }
+}
+
+function renderAll(){
+  renderMachines(); renderWaste(); renderWorkers(); renderTimers();
+  renderDeliveries(); renderParts(); renderSales(); renderLogistics();
+  renderCustomers(); renderResources(); renderMfgSched();
+  renderLog(); updateDashboard();
+}
+
+// ── SEED ─────────────────────────────────────────────
+async function seedMachines(uid){
+  const defs=[
+    {id:'M-01',name:'CNC Alpha',type:'CNC Mill',status:'Running',uptime:94,operator:'—',service:'2024-11-02'},
+    {id:'M-02',name:'Press Beta',type:'Press',status:'Running',uptime:88,operator:'—',service:'2024-10-18'},
+    {id:'M-03',name:'Conveyor C',type:'Conveyor',status:'Running',uptime:99,operator:'—',service:'2024-09-30'},
+    {id:'M-04',name:'Lathe Gamma',type:'Lathe',status:'Fault',uptime:41,operator:'—',service:'2024-08-14'},
+    {id:'M-05',name:'Welder Delta',type:'Welder',status:'Running',uptime:82,operator:'—',service:'2024-11-10'},
+  ];
+  window.machines=[];
+  for(const m of defs){ const r=await addDoc(uCol(uid,'machines'),m); window.machines.push({_id:r.id,...m}); }
+  renderMachines(); updateDashboard();
+}
+
+// ══ DASHBOARD ════════════════════════════════════════
+function updateDashboard(){
+  const running=window.machines.filter(m=>m.status==='Running').length;
+  const faults=window.machines.filter(m=>m.status==='Fault').length;
+  const avgUp=window.machines.length?Math.round(window.machines.reduce((a,m)=>a+m.uptime,0)/window.machines.length):0;
+  const totalWaste=window.wastes.reduce((a,w)=>a+(w.qty||0),0);
+  const totalSales=window.sales.reduce((a,s)=>a+(parseFloat(s.amount)||0),0);
+  const pendingDel=window.deliveries.filter(d=>d.status==='Pending'||d.status==='In Transit').length;
+
+  sv('kpi-machines',running+'/'+window.machines.length);
+  sv('kpi-uptime',avgUp+'%');
+  sv('kpi-waste',totalWaste);
+  sv('kpi-faults',faults);
+  sv('kpi-sales','RM '+totalSales.toLocaleString('en-MY',{minimumFractionDigits:2}));
+  sv('kpi-deliveries',pendingDel);
+
+  // mini machine list
+  const ml=document.getElementById('dash-machines');
+  if(ml) ml.innerHTML=window.machines.slice(0,6).map(m=>{
+    const cls=m.status==='Running'?'dot-green':m.status==='Idle'?'dot-amber':'dot-red';
+    return `<div class="mini-row"><span class="dot ${cls}"></span>
+      <span class="mini-id">${m.id}</span><span class="mini-name">${m.name}</span>
+      <span class="mini-pct ${m.uptime>=80?'pct-g':m.uptime>=50?'pct-a':'pct-r'}">${m.uptime}%</span>
+    </div>`;
+  }).join('')||'<div class="empty-state">No machines yet.</div>';
+
+  // recent deliveries
+  const dl=document.getElementById('dash-deliveries');
+  if(dl) dl.innerHTML=window.deliveries.slice(0,5).map(d=>{
+    const cls=d.status==='Delivered'?'pill-green':d.status==='In Transit'?'pill-blue':'pill-amber';
+    return `<div class="mini-row"><span class="pill ${cls}">${d.status}</span>
+      <span class="mini-name" style="flex:1">${d.customer}</span>
+      <span class="mini-id">${d.date}</span></div>`;
+  }).join('')||'<div class="empty-state">No deliveries scheduled.</div>';
+
+  // recent sales
+  const sl=document.getElementById('dash-sales');
+  if(sl) sl.innerHTML=window.sales.slice(0,5).map(s=>`
+    <div class="mini-row"><span class="mini-name" style="flex:1">${s.customer}</span>
+    <span class="mini-id">${s.item}</span>
+    <span style="font-weight:700;color:var(--green);font-size:13px">RM ${parseFloat(s.amount||0).toFixed(2)}</span></div>
+  `).join('')||'<div class="empty-state">No sales recorded.</div>';
+}
+
+function sv(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; }
+
+// ══ MACHINES ═════════════════════════════════════════
+window.addMachine=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const id=gv('newMId'), name=gv('newMName');
+  if(!id||!name){alert('ID and Name required');return;}
+  const m={id,name,type:gv('newMType'),status:gv('newMStatus'),uptime:100,operator:gv('newMOp')||'—',service:gv('newMSvc')||'—'};
+  const r=await addDoc(uCol(uid,'machines'),m);
+  window.machines.push({_id:r.id,...m});
+  await addLog(uid,'MACHINE',`Registered: ${id} — ${name}`);
+  clearFields(['newMId','newMName','newMOp','newMSvc']);
+  hide('form-machine'); renderMachines(); updateDashboard();
+};
+window.toggleStatus=async(docId)=>{
+  const uid=window._uid; if(!uid) return;
+  const m=window.machines.find(x=>x._id===docId); if(!m) return;
+  const prev=m.status; m.status={Running:'Idle',Idle:'Running',Fault:'Running'}[m.status];
+  await setDoc(uDoc(uid,'machines',docId),m);
+  await addLog(uid,'MACHINE',`${m.id}: ${prev}→${m.status}`);
+  renderMachines(); updateDashboard();
+};
+window.deleteMachine=async(docId)=>{
+  if(!confirm('Delete this machine?')) return;
+  const uid=window._uid; if(!uid) return;
+  await deleteDoc(uDoc(uid,'machines',docId));
+  window.machines=window.machines.filter(x=>x._id!==docId);
+  renderMachines(); updateDashboard();
+};
+function renderMachines(){
+  const tb=document.getElementById('machines-tbody'); if(!tb) return;
+  tb.innerHTML=window.machines.map(m=>{
+    const sc=m.status==='Running'?'pill-green':m.status==='Idle'?'pill-amber':'pill-red';
+    const fc=m.uptime>=80?'bar-green':m.uptime>=50?'bar-amber':'bar-red';
+    return `<tr><td><span class="mono fw6">${m.id}</span></td><td>${m.name}</td><td class="grey">${m.type}</td>
+      <td><span class="pill ${sc}">${m.status}</span></td>
+      <td><div class="bar-wrap"><div class="bar-track"><div class="bar-fill ${fc}" style="width:${m.uptime}%"></div></div><span class="mono sm">${m.uptime}%</span></div></td>
+      <td>${m.operator}</td><td class="mono grey sm">${m.service}</td>
+      <td><div class="acts">
+        <button class="btn-icon" onclick="toggleStatus('${m._id}')">⇄</button>
+        <button class="btn-icon red" onclick="deleteMachine('${m._id}')">✕</button>
+      </div></td></tr>`;
+  }).join('')||noRows(8);
+}
+
+// ══ TIMERS ═══════════════════════════════════════════
+window.timersData=[
+  {id:'T1',machine:'M-01',label:'CNC Alpha',running:false,elapsed:0,task:'Batch Run'},
+  {id:'T2',machine:'M-02',label:'Press Beta',running:false,elapsed:0,task:'Shift Run'},
+];
+window.timerIVs={};
+function fmtS(s){return`${pad(Math.floor(s/3600))}:${pad(Math.floor((s%3600)/60))}:${pad(s%60)}`;}
+function pad(n){return String(n).padStart(2,'0');}
+window.renderTimers=function(){
+  const g=document.getElementById('timers-grid'); if(!g) return;
+  g.innerHTML=window.timersData.map(t=>`
+    <div class="timer-card">
+      <div class="timer-label">${t.machine} · <span class="grey">${t.task}</span></div>
+      <div class="timer-display" id="td-${t.id}">${fmtS(t.elapsed)}</div>
+      <div class="timer-btns">
+        <button class="btn ${t.running?'btn-danger':'btn-success'} sm" onclick="toggleTimer('${t.id}')">${t.running?'■ Stop':'▶ Start'}</button>
+        <button class="btn btn-ghost sm" onclick="resetTimer('${t.id}')">↺ Reset</button>
+      </div>
+      <div class="grey sm mt4">${t.label}</div>
+    </div>`).join('');
+  const sb=document.getElementById('session-log'); if(!sb) return;
+  sb.innerHTML=window.sessions.map(s=>`<tr>
+    <td class="mono">${s.machine}</td><td>${s.operator}</td>
+    <td class="mono grey">${s.start}</td><td class="mono grey">${s.end||'—'}</td>
+    <td class="mono fw6" style="color:var(--blue)">${s.dur||'—'}</td><td class="grey">${s.task}</td>
+  </tr>`).join('')||noRows(6);
+};
+window.toggleTimer=async function(id){
+  const uid=window._uid;
+  const t=window.timersData.find(x=>x.id===id); if(!t) return;
+  t.running=!t.running;
+  if(t.running){
+    t._st=Date.now()-t.elapsed*1000;
+    window.timerIVs[id]=setInterval(()=>{
+      t.elapsed=Math.floor((Date.now()-t._st)/1000);
+      const el=document.getElementById('td-'+id); if(el) el.textContent=fmtS(t.elapsed);
+    },500);
+    if(uid) await addLog(uid,'TIMER',`${t.machine} started — ${t.task}`);
+  } else {
+    clearInterval(window.timerIVs[id]); delete window.timerIVs[id];
+    if(uid){
+      const ses={machine:t.machine,operator:window._uname||'—',
+        start:new Date(t._st).toTimeString().slice(0,5),
+        end:new Date().toTimeString().slice(0,5),dur:fmtS(t.elapsed),task:t.task,createdAt:serverTimestamp()};
+      const r=await addDoc(uCol(uid,'sessions'),ses);
+      window.sessions.unshift({_id:r.id,...ses});
+      await addLog(uid,'TIMER',`${t.machine} stopped — ${fmtS(t.elapsed)}`);
+    }
+    window.renderTimers(); return;
+  }
+  window.renderTimers();
+};
+window.resetTimer=function(id){
+  const t=window.timersData.find(x=>x.id===id); if(!t) return;
+  clearInterval(window.timerIVs[id]); delete window.timerIVs[id];
+  t.running=false; t.elapsed=0; window.renderTimers();
+};
+window.addTimer=function(){
+  const m=window.machines[0];
+  window.timersData.push({id:'T'+Date.now(),machine:m?.id||'M-01',label:m?.name||'Machine',running:false,elapsed:0,task:'New Task'});
+  window.renderTimers();
+};
+
+// ══ WASTE ════════════════════════════════════════════
+window.logWaste=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const qty=parseInt(gv('wasteQty'))||0; if(!qty){alert('Enter quantity');return;}
+  const w={time:ts(),machine:gv('wasteM'),qty,cause:gv('wasteCause'),sev:gv('wasteSev'),notes:gv('wasteNotes'),createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'waste'),w);
+  window.wastes.unshift({_id:r.id,...w});
+  await addLog(uid,'WASTE',`${qty} units — ${w.cause}`);
+  clearFields(['wasteQty','wasteNotes']); renderWaste(); updateDashboard();
+};
+function renderWaste(){
+  const tb=document.getElementById('waste-tbody'); if(!tb) return;
+  tb.innerHTML=window.wastes.map((w,i)=>{
+    const sc=w.sev==='High'?'pill-red':w.sev==='Medium'?'pill-amber':'pill-green';
+    return `<tr><td class="mono grey">${String(i+1).padStart(2,'0')}</td>
+      <td class="mono grey">${w.time}</td><td>${w.machine}</td>
+      <td class="fw7" style="color:var(--red)">${w.qty}</td>
+      <td>${w.cause}</td><td><span class="pill ${sc}">${w.sev}</span></td>
+      <td class="grey sm">${w.notes||'—'}</td></tr>`;
+  }).join('')||noRows(7);
+}
+
+// ══ WORKERS ══════════════════════════════════════════
+window.addWorker=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const name=gv('wkName'),wid=gv('wkId');
+  if(!name||!wid){alert('Name and ID required');return;}
+  const units=parseInt(gv('wkUnits'))||0;
+  const w={name,id:wid,machine:gv('wkMachine'),shift:gv('wkShift'),units,eff:Math.min(100,Math.round((units/350)*100)),status:gv('wkStatus'),notes:gv('wkNotes'),createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'workers'),w);
+  window.workers.unshift({_id:r.id,...w});
+  await addLog(uid,'WORKER',`Added: ${name} (${wid})`);
+  clearFields(['wkName','wkId','wkUnits','wkNotes']); renderWorkers();
+};
+const aC=['#0ea5e9','#8b5cf6','#f59e0b','#10b981','#ef4444','#6366f1','#ec4899'];
+function aColor(n){let h=0;for(let c of n)h+=c.charCodeAt(0);return aC[h%aC.length];}
+function ini(n){return n.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();}
+function renderWorkers(){
+  const tb=document.getElementById('workers-tbody'); if(!tb) return;
+  tb.innerHTML=window.workers.map(w=>{
+    const sc=w.status==='Active'?'pill-green':w.status==='Break'?'pill-amber':'pill-red';
+    const fc=w.eff>=85?'bar-green':w.eff>=70?'bar-amber':'bar-red';
+    return `<tr><td><div class="wa-wrap"><div class="wa" style="background:${aColor(w.name)}">${ini(w.name)}</div><span>${w.name}</span></div></td>
+      <td class="mono grey">${w.id}</td><td class="grey">${w.machine}</td><td class="grey">${w.shift}</td>
+      <td class="fw7" style="color:var(--blue)">${w.units}</td>
+      <td><div class="bar-wrap"><div class="bar-track"><div class="bar-fill ${fc}" style="width:${w.eff}%"></div></div><span class="mono sm">${w.eff}%</span></div></td>
+      <td><span class="pill ${sc}">${w.status}</span></td>
+      <td class="grey sm">${w.notes||'—'}</td></tr>`;
+  }).join('')||noRows(8);
+}
+
+// ══ DELIVERIES ═══════════════════════════════════════
+window.addDelivery=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const customer=gv('delCustomer'); if(!customer){alert('Customer required');return;}
+  const d={customer,items:gv('delItems'),date:gv('delDate'),eta:gv('delEta'),status:gv('delStatus'),driver:gv('delDriver'),notes:gv('delNotes'),createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'deliveries'),d);
+  window.deliveries.unshift({_id:r.id,...d});
+  await addLog(uid,'DELIVERY',`Scheduled: ${customer} — ${d.date}`);
+  clearFields(['delCustomer','delItems','delDate','delEta','delDriver','delNotes']);
+  hide('form-delivery'); renderDeliveries(); updateDashboard();
+};
+function renderDeliveries(){
+  const tb=document.getElementById('del-tbody'); if(!tb) return;
+  tb.innerHTML=window.deliveries.map(d=>{
+    const sc=d.status==='Delivered'?'pill-green':d.status==='In Transit'?'pill-blue':d.status==='Delayed'?'pill-red':'pill-amber';
+    return `<tr><td>${d.customer}</td><td class="grey">${d.items}</td>
+      <td class="mono grey">${d.date}</td><td class="mono grey">${d.eta||'—'}</td>
+      <td><span class="pill ${sc}">${d.status}</span></td>
+      <td class="grey">${d.driver||'—'}</td><td class="grey sm">${d.notes||'—'}</td></tr>`;
+  }).join('')||noRows(7);
+}
+
+// ══ PARTS PROGRESS ═══════════════════════════════════
+window.addPart=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const name=gv('partName'); if(!name){alert('Part name required');return;}
+  const total=parseInt(gv('partTotal'))||100;
+  const done=parseInt(gv('partDone'))||0;
+  const p={name,partNo:gv('partNo'),machine:gv('partMachine'),total,done,status:gv('partStatus'),dueDate:gv('partDue'),notes:gv('partNotes'),createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'parts'),p);
+  window.parts.unshift({_id:r.id,...p});
+  await addLog(uid,'PARTS',`Added: ${name} (${done}/${total})`);
+  clearFields(['partName','partNo','partMachine','partTotal','partDone','partDue','partNotes']);
+  hide('form-parts'); renderParts();
+};
+function renderParts(){
+  const tb=document.getElementById('parts-tbody'); if(!tb) return;
+  tb.innerHTML=window.parts.map(p=>{
+    const pct=Math.round((p.done/p.total)*100)||0;
+    const sc=p.status==='Complete'?'pill-green':p.status==='In Progress'?'pill-blue':'pill-amber';
+    const fc=pct>=80?'bar-green':pct>=40?'bar-blue':'bar-amber';
+    return `<tr><td class="fw6">${p.name}</td><td class="mono grey">${p.partNo||'—'}</td>
+      <td class="grey">${p.machine||'—'}</td>
+      <td><div class="prog-wrap"><div class="bar-track full"><div class="bar-fill ${fc}" style="width:${pct}%"></div></div>
+        <span class="mono sm">${p.done}/${p.total} (${pct}%)</span></div></td>
+      <td><span class="pill ${sc}">${p.status}</span></td>
+      <td class="mono grey">${p.dueDate||'—'}</td>
+      <td class="grey sm">${p.notes||'—'}</td></tr>`;
+  }).join('')||noRows(7);
+}
+
+// ══ SALES — REAL-TIME ════════════════════════════════
+let _salesUnsub=null;
+function subscribeSales(uid){
+  if(_salesUnsub) _salesUnsub();
+  const q=query(uCol(uid,'sales'),orderBy('createdAt','desc'));
+  _salesUnsub=onSnapshot(q,snap=>{
+    const wasEmpty=!window.sales.length;
+    window.sales=snap.docs.map(d=>({_id:d.id,...d.data()}));
+    renderSales(); renderSalesChart(); updateDashboard();
+    if(!wasEmpty) snap.docChanges().forEach(ch=>{
+      if(ch.type==='added'&&!snap.metadata.hasPendingWrites){
+        const d=ch.doc.data();
+        showToast('New sale: '+d.customer+' — RM '+parseFloat(d.amount||0).toFixed(2),'sales');
+      }
+    });
+  },err=>console.warn('sales listener',err));
+}
+window.addSale=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const customer=gv('saleCustomer'); if(!customer){alert('Customer required');return;}
+  const s={customer,item:gv('saleItem'),qty:parseInt(gv('saleQty'))||1,amount:parseFloat(gv('saleAmount'))||0,status:gv('saleStatus'),date:gv('saleDate')||dateStr(),invoiceNo:gv('saleInv'),notes:gv('saleNotes'),createdAt:serverTimestamp()};
+  await addDoc(uCol(uid,'sales'),s);
+  await addLog(uid,'SALES','Sale: '+customer+' — RM '+s.amount);
+  clearFields(['saleCustomer','saleItem','saleQty','saleAmount','saleInv','saleNotes']);
+  hide('form-sales');
+};
+function renderSales(){
+  const tb=document.getElementById('sales-tbody'); if(!tb) return;
+  const total=window.sales.reduce((a,s)=>a+(parseFloat(s.amount)||0),0);
+  tb.innerHTML=window.sales.map(s=>{
+    const sc=s.status==='Paid'?'pill-green':s.status==='Pending'?'pill-amber':'pill-red';
+    return '<tr><td class="mono grey">'+( s.invoiceNo||'—')+'</td><td class="fw6">'+s.customer+'</td>'
+      +'<td class="grey">'+s.item+'</td><td class="grey">'+s.qty+'</td>'
+      +'<td class="fw7" style="color:var(--green)">RM '+parseFloat(s.amount||0).toFixed(2)+'</td>'
+      +'<td><span class="pill '+sc+'">'+s.status+'</span></td>'
+      +'<td class="mono grey">'+s.date+'</td><td class="grey sm">'+(s.notes||'—')+'</td></tr>';
+  }).join('')||noRows(8);
+  const tf=document.getElementById('sales-total'); if(tf) tf.textContent='Total: RM '+total.toLocaleString('en-MY',{minimumFractionDigits:2});
+}
+function renderSalesChart(){
+  const el=document.getElementById('sales-chart'); if(!el) return;
+  if(!window.sales.length){el.innerHTML='<div class="chart-empty">Add a sale to see the live chart.</div>';return;}
+  const byDate={};
+  [...window.sales].reverse().forEach(s=>{const d=s.date||'?';byDate[d]=(byDate[d]||0)+(parseFloat(s.amount)||0);});
+  const dates=Object.keys(byDate).slice(-8);
+  const vals=dates.map(d=>byDate[d]);
+  const max=Math.max(...vals,1);
+  const paid=window.sales.filter(s=>s.status==='Paid').reduce((a,s)=>a+(parseFloat(s.amount)||0),0);
+  const pending=window.sales.filter(s=>s.status==='Pending').reduce((a,s)=>a+(parseFloat(s.amount)||0),0);
+  const overdue=window.sales.filter(s=>s.status==='Overdue').reduce((a,s)=>a+(parseFloat(s.amount)||0),0);
+  const total=window.sales.reduce((a,s)=>a+(parseFloat(s.amount)||0),0);
+  const bars=dates.map((d,i)=>{
+    const h=Math.max(8,Math.round((vals[i]/max)*140));
+    return '<div class="chart-col"><div class="chart-tooltip">RM '+vals[i].toFixed(2)+'</div>'
+      +'<div class="chart-bar" style="height:'+h+'px;animation-delay:'+(i*0.07)+'s"></div>'
+      +'<div class="chart-lbl">'+(d.length>5?d.slice(-5):d)+'</div></div>';
+  }).join('');
+  el.innerHTML='<div class="chart-summary">'
+    +'<div class="chart-stat cs-green"><div class="cs-lbl">Paid</div><div class="cs-val">RM '+paid.toLocaleString('en-MY',{minimumFractionDigits:2})+'</div></div>'
+    +'<div class="chart-stat cs-amber"><div class="cs-lbl">Pending</div><div class="cs-val">RM '+pending.toLocaleString('en-MY',{minimumFractionDigits:2})+'</div></div>'
+    +'<div class="chart-stat cs-red"><div class="cs-lbl">Overdue</div><div class="cs-val">RM '+overdue.toLocaleString('en-MY',{minimumFractionDigits:2})+'</div></div>'
+    +'<div class="chart-stat cs-blue"><div class="cs-lbl">Total</div><div class="cs-val">RM '+total.toLocaleString('en-MY',{minimumFractionDigits:2})+'</div></div>'
+    +'</div><div class="chart-area"><div class="chart-bars">'+bars+'</div>'
+    +'<div class="chart-live-badge"><span class="live-dot"></span>LIVE</div></div>';
+}
+
+// ══ LOGISTICS — REAL-TIME ════════════════════════════
+let _logisticsUnsub=null;
+function subscribeLogistics(uid){
+  if(_logisticsUnsub) _logisticsUnsub();
+  const q=query(uCol(uid,'logistics'),orderBy('createdAt','desc'));
+  _logisticsUnsub=onSnapshot(q,snap=>{
+    window.logistics=snap.docs.map(d=>({_id:d.id,...d.data()}));
+    renderLogistics();
+    snap.docChanges().forEach(ch=>{
+      if(ch.type==='modified'){
+        const d=ch.doc.data();
+        showToast('Shipment '+d.ref+' updated to: '+d.status,'logistics');
+      }
+    });
+  },err=>console.warn('logistics listener',err));
+}
+window.addLogistic=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const ref=gv('logRef'); if(!ref){alert('Reference required');return;}
+  const l={ref,carrier:gv('logCarrier'),origin:gv('logOrigin'),destination:gv('logDest'),status:gv('logStatus'),depDate:gv('logDep'),arrDate:gv('logArr'),weight:gv('logWeight'),tracking:gv('logTracking'),notes:gv('logNotes'),createdAt:serverTimestamp()};
+  await addDoc(uCol(uid,'logistics'),l);
+  await addLog(uid,'LOGISTICS','Shipment: '+ref+' — '+l.origin+'->'+l.destination);
+  clearFields(['logRef','logCarrier','logOrigin','logDest','logDep','logArr','logWeight','logTracking','logNotes']);
+  hide('form-logistics');
+};
+window.updateLogisticStatus=async(docId,newStatus)=>{
+  const uid=window._uid; if(!uid) return;
+  const l=window.logistics.find(x=>x._id===docId); if(!l) return;
+  await setDoc(uDoc(uid,'logistics',docId),{...l,status:newStatus});
+  await addLog(uid,'LOGISTICS',l.ref+': status -> '+newStatus);
+};
+function renderLogistics(){
+  const tb=document.getElementById('log-tbody2'); if(!tb) return;
+  const steps=['Pending','In Transit','Delivered'];
+  tb.innerHTML=window.logistics.map(l=>{
+    const si=steps.indexOf(l.status);
+    const tracker=steps.map((s,i)=>
+      '<div class="step '+(i<si?'step-done':i===si?'step-active':'')+'">'
+      +'<div class="step-dot"></div><div class="step-lbl">'+s+'</div></div>'
+      +(i<steps.length-1?'<div class="step-line '+(i<si?'line-done':'')+'"></div>':'')
+    ).join('');
+    const delayed=l.status==='Delayed';
+    return '<tr>'
+      +'<td class="mono fw6">'+l.ref+'</td>'
+      +'<td class="grey">'+(l.carrier||'—')+'</td>'
+      +'<td>'+l.origin+'</td><td>'+l.destination+'</td>'
+      +'<td style="min-width:280px">'
+        +'<div class="tracker-row">'+tracker+'</div>'
+        +(delayed?'<span class="pill pill-red" style="margin-top:4px;display:inline-flex">⚠ Delayed</span>':'')
+        +'<div class="status-btns">'
+          +'<button class="sbtn '+(l.status==='Pending'?'sbtn-active':'')+'" onclick="updateLogisticStatus(''+l._id+'','Pending')">Pending</button>'
+          +'<button class="sbtn '+(l.status==='In Transit'?'sbtn-active sbtn-blue':'')+'" onclick="updateLogisticStatus(''+l._id+'','In Transit')">In Transit</button>'
+          +'<button class="sbtn '+(l.status==='Delivered'?'sbtn-active sbtn-green':'')+'" onclick="updateLogisticStatus(''+l._id+'','Delivered')">Delivered</button>'
+          +'<button class="sbtn sbtn-red '+(l.status==='Delayed'?'sbtn-active':'')+'" onclick="updateLogisticStatus(''+l._id+'','Delayed')">Delayed</button>'
+        +'</div>'
+      +'</td>'
+      +'<td class="mono grey">'+(l.depDate||'—')+'</td>'
+      +'<td class="mono grey">'+(l.arrDate||'—')+'</td>'
+      +'<td class="mono grey">'+(l.weight||'—')+'</td>'
+      +'<td class="grey sm">'+(l.tracking||'—')+'</td>'
+    +'</tr>';
+  }).join('')||noRows(9);
+}
+
+// ══ CUSTOMERS ════════════════════════════════════════
+window.addCustomer=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const name=gv('custName'); if(!name){alert('Name required');return;}
+  const c={name,company:gv('custCompany'),address:gv('custAddress'),city:gv('custCity'),phone:gv('custPhone'),email:gv('custEmail'),items:gv('custItems'),notes:gv('custNotes'),createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'customers'),c);
+  window.customers.unshift({_id:r.id,...c});
+  await addLog(uid,'CUSTOMER',`Added: ${name} — ${c.company||c.city}`);
+  clearFields(['custName','custCompany','custAddress','custCity','custPhone','custEmail','custItems','custNotes']);
+  hide('form-customer'); renderCustomers();
+};
+function renderCustomers(){
+  const tb=document.getElementById('cust-tbody'); if(!tb) return;
+  tb.innerHTML=window.customers.map(c=>{
+    return `<tr><td><div class="wa-wrap"><div class="wa" style="background:${aColor(c.name)}">${ini(c.name)}</div><span class="fw6">${c.name}</span></div></td>
+      <td class="grey">${c.company||'—'}</td>
+      <td>${c.address||'—'}</td>
+      <td class="grey">${c.city||'—'}</td>
+      <td class="mono grey">${c.phone||'—'}</td>
+      <td class="grey">${c.email||'—'}</td>
+      <td class="grey sm">${c.items||'—'}</td>
+      <td class="grey sm">${c.notes||'—'}</td></tr>`;
+  }).join('')||noRows(8);
+}
+
+// ══ RESOURCES ════════════════════════════════════════
+window.addResource=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const name=gv('resName'); if(!name){alert('Resource name required');return;}
+  const total=parseInt(gv('resTotal'))||1;
+  const avail=parseInt(gv('resAvail'))||0;
+  const r2={name,type:gv('resType'),total,avail,unit:gv('resUnit'),status:gv('resStatus'),supplier:gv('resSupplier'),reorderAt:parseInt(gv('resReorder'))||0,notes:gv('resNotes'),createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'resources'),r2);
+  window.resources.unshift({_id:r.id,...r2});
+  await addLog(uid,'RESOURCE',`Added: ${name} (${avail}/${total} ${r2.unit})`);
+  clearFields(['resName','resTotal','resAvail','resUnit','resSupplier','resReorder','resNotes']);
+  hide('form-resource'); renderResources();
+};
+function renderResources(){
+  const tb=document.getElementById('res-tbody'); if(!tb) return;
+  tb.innerHTML=window.resources.map(r=>{
+    const pct=Math.round((r.avail/r.total)*100)||0;
+    const low=r.avail<=r.reorderAt;
+    const sc=r.status==='Available'?'pill-green':r.status==='Low Stock'?'pill-amber':'pill-red';
+    const fc=pct>=60?'bar-green':pct>=30?'bar-amber':'bar-red';
+    return `<tr><td class="fw6">${r.name}${low?'<span class="pill pill-red ml4" style="font-size:9px">LOW</span>':''}</td>
+      <td class="grey">${r.type}</td>
+      <td><div class="prog-wrap"><div class="bar-track full"><div class="bar-fill ${fc}" style="width:${pct}%"></div></div>
+        <span class="mono sm">${r.avail}/${r.total} ${r.unit}</span></div></td>
+      <td><span class="pill ${sc}">${r.status}</span></td>
+      <td class="grey">${r.supplier||'—'}</td>
+      <td class="mono grey">${r.reorderAt||'—'}</td>
+      <td class="grey sm">${r.notes||'—'}</td></tr>`;
+  }).join('')||noRows(7);
+}
+
+// ══ MFG SCHEDULE ═════════════════════════════════════
+window.addMfgSched=async()=>{
+  const uid=window._uid; if(!uid) return;
+  const jobName=gv('mfgJob'); if(!jobName){alert('Job name required');return;}
+  const m={jobName,jobNo:gv('mfgNo'),machine:gv('mfgMachine'),operator:gv('mfgOp'),startDate:gv('mfgStart'),endDate:gv('mfgEnd'),shift:gv('mfgShift'),priority:gv('mfgPriority'),status:gv('mfgStatus'),qty:parseInt(gv('mfgQty'))||0,notes:gv('mfgNotes'),createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'mfgschedule'),m);
+  window.mfgsched.unshift({_id:r.id,...m});
+  await addLog(uid,'MFG',`Job: ${jobName} on ${m.machine}`);
+  clearFields(['mfgJob','mfgNo','mfgMachine','mfgOp','mfgStart','mfgEnd','mfgQty','mfgNotes']);
+  hide('form-mfg'); renderMfgSched();
+};
+function renderMfgSched(){
+  const tb=document.getElementById('mfg-tbody'); if(!tb) return;
+  tb.innerHTML=window.mfgsched.map(m=>{
+    const sc=m.status==='Complete'?'pill-green':m.status==='In Progress'?'pill-blue':m.status==='Delayed'?'pill-red':'pill-amber';
+    const pc=m.priority==='High'?'pill-red':m.priority==='Medium'?'pill-amber':'pill-green';
+    return `<tr><td><span class="mono fw6">${m.jobNo||'—'}</span></td>
+      <td class="fw6">${m.jobName}</td>
+      <td class="grey">${m.machine||'—'}</td><td class="grey">${m.operator||'—'}</td>
+      <td class="mono grey">${m.startDate||'—'}</td><td class="mono grey">${m.endDate||'—'}</td>
+      <td class="grey">${m.shift||'—'}</td>
+      <td><span class="pill ${pc}">${m.priority}</span></td>
+      <td><span class="pill ${sc}">${m.status}</span></td>
+      <td class="grey">${m.qty||'—'}</td>
+      <td class="grey sm">${m.notes||'—'}</td></tr>`;
+  }).join('')||noRows(11);
+}
+
+// ══ LOG ══════════════════════════════════════════════
+async function addLog(uid,type,desc){
+  const e={time:ts(),type,desc,user:window._uname||'User',createdAt:serverTimestamp()};
+  const r=await addDoc(uCol(uid,'log'),e);
+  window.logs.unshift({_id:r.id,...e});
+  const c=document.getElementById('log-count'); if(c) c.textContent=window.logs.length+' events';
+  if(document.getElementById('panel-log')?.classList.contains('active')) renderLog();
+}
+function renderLog(){
+  const tb=document.getElementById('log-tbody3'); if(!tb) return;
+  const tc={MACHINE:'var(--blue)',TIMER:'var(--teal)',WASTE:'var(--red)',WORKER:'var(--amber)',DELIVERY:'var(--purple)',SALES:'var(--green)',LOGISTICS:'var(--indigo)',CUSTOMER:'var(--pink)',RESOURCE:'var(--orange)',MFG:'var(--cyan)',PARTS:'var(--violet)'};
+  tb.innerHTML=window.logs.map(e=>`<tr>
+    <td class="mono grey">${e.time}</td>
+    <td><span class="pill" style="background:${tc[e.type]||'#94a3b8'}20;color:${tc[e.type]||'#94a3b8'};border:1px solid ${tc[e.type]||'#94a3b8'}40">${e.type}</span></td>
+    <td>${e.desc}</td><td class="grey">${e.user}</td>
+  </tr>`).join('')||noRows(4);
+  const c=document.getElementById('log-count'); if(c) c.textContent=window.logs.length+' events';
+}
+
+// ══ TOAST ════════════════════════════════════════════
+function showToast(msg, type){
+  const existing=document.getElementById('toast-container');
+  const container=existing||document.createElement('div');
+  if(!existing){ container.id='toast-container'; document.body.appendChild(container); }
+  const t=document.createElement('div');
+  t.className='toast toast-'+type;
+  t.innerHTML=msg;
+  container.appendChild(t);
+  setTimeout(()=>t.classList.add('toast-show'),10);
+  setTimeout(()=>{ t.classList.remove('toast-show'); setTimeout(()=>t.remove(),400); },4000);
+}
+
+// ══ NAV ══════════════════════════════════════════════
+const pageTitles={
+  dashboard:'Dashboard',machines:'Machine Status',timers:'Time Tracker',
+  waste:'Waste Counter',workers:'Worker Records',deliveries:'Delivery Schedule',
+  parts:'Part Progress',sales:'Total Sales',logistics:'Logistics',
+  customers:'Customers & Items',resources:'Resource Planning',mfgschedule:'Manufacturing Schedule',log:'Activity Log'
+};
+window.switchTab=function(id){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(n=>n.classList.remove('active'));
+  document.getElementById('panel-'+id)?.classList.add('active');
+  document.querySelector(`.nav-link[data-tab="${id}"]`)?.classList.add('active');
+  document.getElementById('page-title').textContent=pageTitles[id]||id;
+  if(id==='dashboard') updateDashboard();
+  if(id==='sales') renderSales();
+};
+
+// ── HELPERS ──────────────────────────────────────────
+function gv(id){ const e=document.getElementById(id); return e?e.value.trim():''; }
+function hide(id){ const e=document.getElementById(id); if(e) e.style.display='none'; }
+function show(id){ const e=document.getElementById(id); if(e) e.style.display='block'; }
+function clearFields(ids){ ids.forEach(id=>{ const e=document.getElementById(id); if(e) e.value=''; }); }
+function noRows(cols){ return `<tr><td colspan="${cols}" class="empty-td">No records yet. Add one above.</td></tr>`; }
+window.toggleForm=function(id){ const e=document.getElementById(id); if(e) e.style.display=e.style.display==='none'?'block':'none'; }
+</script>
+
+<style>
+:root{
+  --bg:#f0f4f8; --sur:#ffffff; --sur2:#f8fafc; --sur3:#f1f5f9;
+  --br:#e2e8f0; --br2:#cbd5e1;
+  --txt:#0f172a; --txt2:#475569; --txt3:#94a3b8;
+  --blue:#2563eb; --teal:#0d9488; --green:#16a34a;
+  --amber:#d97706; --red:#dc2626; --purple:#7c3aed;
+  --indigo:#4338ca; --pink:#db2777; --orange:#ea580c;
+  --cyan:#0891b2; --violet:#7c3aed;
+  --sidebar:#1e293b; --sidebar2:#0f172a;
+  --accent:#2563eb;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:'Plus Jakarta Sans',sans-serif;font-size:14px;min-height:100vh}
+
+/* ── LOGIN ─────────────────────────── */
+#login-screen{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#1e293b 0%,#0f172a 50%,#1e3a5f 100%)}
+.login-card{background:#fff;border-radius:20px;padding:56px 64px;text-align:center;max-width:440px;width:90%;
+  box-shadow:0 32px 80px rgba(0,0,0,.35);animation:fadeUp .5s ease}
+.login-logo{font-size:36px;font-weight:800;color:var(--blue);letter-spacing:-1px;margin-bottom:4px}
+.login-logo span{color:var(--txt3)}
+.login-sub{font-size:11px;font-weight:600;letter-spacing:4px;text-transform:uppercase;color:var(--txt3);margin-bottom:32px}
+.login-desc{font-size:14px;color:var(--txt2);margin-bottom:36px;line-height:1.7}
+#signin-btn{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;padding:14px 24px;
+  border-radius:10px;border:1.5px solid var(--br2);background:#fff;color:var(--txt);
+  font-family:'Plus Jakarta Sans',sans-serif;font-size:15px;font-weight:600;cursor:pointer;transition:all .2s}
+#signin-btn:hover{background:var(--sur3);box-shadow:0 4px 16px rgba(0,0,0,.1);transform:translateY(-1px)}
+.login-note{font-size:12px;color:var(--txt3);margin-top:20px}
+.spinner{width:16px;height:16px;border:2px solid var(--br2);border-top-color:var(--blue);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── SHELL ─────────────────────────── */
+.shell{display:flex;height:100vh;overflow:hidden}
+.sidebar{width:240px;min-width:240px;background:var(--sidebar);display:flex;flex-direction:column;overflow-y:auto}
+.sidebar::-webkit-scrollbar{width:0}
+.s-logo{padding:24px 20px 20px;border-bottom:1px solid rgba(255,255,255,.08)}
+.s-logo-text{font-size:20px;font-weight:800;color:#fff;letter-spacing:-0.5px}
+.s-logo-text span{color:#64748b}
+.s-logo-sub{font-size:10px;font-weight:600;letter-spacing:3px;text-transform:uppercase;color:#475569;margin-top:3px}
+.s-section{padding:20px 12px 8px;font-size:10px;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:#475569}
+.nav-link{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;cursor:pointer;
+  color:#94a3b8;font-size:13px;font-weight:500;transition:all .15s;margin:1px 8px;text-decoration:none}
+.nav-link:hover{background:rgba(255,255,255,.07);color:#e2e8f0}
+.nav-link.active{background:var(--blue);color:#fff}
+.nav-link.active .nav-ic{color:#fff}
+.nav-ic{font-size:16px;width:20px;text-align:center;flex-shrink:0}
+.s-bottom{padding:16px;border-top:1px solid rgba(255,255,255,.08);margin-top:auto}
+.u-row{display:flex;align-items:center;gap:10px}
+#u-av{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--blue),var(--teal));
+  display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:#fff;flex-shrink:0;overflow:hidden}
+#u-name{font-size:13px;color:#e2e8f0;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
+#u-email{font-size:11px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
+.btn-signout{margin-top:10px;width:100%;padding:6px;background:transparent;border:1px solid rgba(255,255,255,.1);
+  color:#64748b;border-radius:6px;cursor:pointer;font-size:11px;font-family:'Plus Jakarta Sans',sans-serif;font-weight:500;transition:all .15s}
+.btn-signout:hover{color:#ef4444;border-color:#ef4444}
+
+/* ── MAIN ─────────────────────────── */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 28px;
+  background:var(--sur);border-bottom:1px solid var(--br);flex-shrink:0}
+#page-title{font-size:20px;font-weight:800;color:var(--txt)}
+.topbar-right{display:flex;align-items:center;gap:14px}
+.shift-chip{font-size:11px;font-weight:600;color:var(--blue);background:#eff6ff;border:1px solid #bfdbfe;
+  padding:5px 12px;border-radius:20px;letter-spacing:.5px}
+.live-badge{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--teal);font-weight:600}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--teal);animation:pulse 2s infinite}
+#clock{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--txt2)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.content{flex:1;overflow-y:auto;padding:24px 28px}
+.content::-webkit-scrollbar{width:6px}
+.content::-webkit-scrollbar-thumb{background:var(--br2);border-radius:3px}
+
+/* ── PANELS ───────────────────────── */
+.panel{display:none}
+.panel.active{display:block;animation:fadeUp .3s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+/* ── KPI STRIP ────────────────────── */
+.kpi-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:24px}
+.kpi-card{background:var(--sur);border:1px solid var(--br);border-radius:12px;padding:16px 18px;position:relative;overflow:hidden}
+.kpi-card::after{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:12px 12px 0 0}
+.kpi-blue::after{background:var(--blue)}.kpi-teal::after{background:var(--teal)}
+.kpi-red::after{background:var(--red)}.kpi-amber::after{background:var(--amber)}
+.kpi-green::after{background:var(--green)}.kpi-purple::after{background:var(--purple)}
+.kpi-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:var(--txt3);margin-bottom:8px}
+.kpi-val{font-size:26px;font-weight:800;line-height:1}
+.kpi-blue .kpi-val{color:var(--blue)}.kpi-teal .kpi-val{color:var(--teal)}
+.kpi-red .kpi-val{color:var(--red)}.kpi-amber .kpi-val{color:var(--amber)}
+.kpi-green .kpi-val{color:var(--green)}.kpi-purple .kpi-val{color:var(--purple)}
+.kpi-sub{font-size:11px;color:var(--txt3);margin-top:4px}
+
+/* ── CARDS ────────────────────────── */
+.card{background:var(--sur);border:1px solid var(--br);border-radius:12px;padding:20px 22px;margin-bottom:18px}
+.card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.card-title{font-size:15px;font-weight:700;color:var(--txt)}
+.card-sub{font-size:12px;color:var(--txt3);font-weight:500}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+
+/* ── TABLES ───────────────────────── */
+.tbl-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--txt3);
+  padding:10px 14px;text-align:left;border-bottom:2px solid var(--br);white-space:nowrap}
+td{padding:11px 14px;border-bottom:1px solid var(--br);font-size:13px;color:var(--txt)}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--sur2)}
+.empty-td{text-align:center;color:var(--txt3);padding:32px!important;font-style:italic}
+
+/* ── FORMS ────────────────────────── */
+.form-panel{background:var(--sur2);border:1px solid var(--br);border-radius:10px;padding:20px;margin-bottom:18px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.form-grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.fg{display:flex;flex-direction:column;gap:5px}
+.fg.full{grid-column:1/-1}
+label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:var(--txt2)}
+input,select,textarea{background:#fff;border:1.5px solid var(--br);color:var(--txt);border-radius:8px;
+  padding:8px 12px;font-family:'Plus Jakarta Sans',sans-serif;font-size:13px;outline:none;transition:border-color .15s;width:100%}
+input:focus,select:focus,textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px #2563eb18}
+textarea{resize:vertical;min-height:70px}
+select option{background:#fff}
+.form-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
+
+/* ── BUTTONS ──────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;border:none;
+  font-family:'Plus Jakarta Sans',sans-serif;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--blue);color:#fff}
+.btn-primary:hover{background:#1d4ed8}
+.btn-success{background:#dcfce7;color:var(--green);border:1.5px solid #86efac}
+.btn-success:hover{background:#bbf7d0}
+.btn-danger{background:#fee2e2;color:var(--red);border:1.5px solid #fca5a5}
+.btn-danger:hover{background:#fecaca}
+.btn-ghost{background:var(--sur3);color:var(--txt2);border:1.5px solid var(--br)}
+.btn-ghost:hover{background:var(--br);color:var(--txt)}
+.btn.sm{padding:5px 12px;font-size:12px;border-radius:6px}
+.btn-icon{width:28px;height:28px;border-radius:6px;border:1.5px solid var(--br);background:var(--sur3);
+  color:var(--txt2);cursor:pointer;font-size:13px;display:inline-flex;align-items:center;justify-content:center;transition:all .15s}
+.btn-icon:hover{background:var(--br);color:var(--txt)}
+.btn-icon.red:hover{background:#fee2e2;border-color:#fca5a5;color:var(--red)}
+.acts{display:flex;gap:6px}
+
+/* ── PILLS ────────────────────────── */
+.pill{display:inline-flex;align-items:center;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;letter-spacing:.3px}
+.pill-green{background:#dcfce7;color:#15803d;border:1px solid #86efac}
+.pill-red{background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5}
+.pill-amber{background:#fef3c7;color:#92400e;border:1px solid #fcd34d}
+.pill-blue{background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd}
+.pill-purple{background:#ede9fe;color:#5b21b6;border:1px solid #c4b5fd}
+.ml4{margin-left:4px}
+
+/* ── BARS ─────────────────────────── */
+.bar-wrap{display:flex;align-items:center;gap:8px}
+.bar-track{height:6px;border-radius:3px;background:var(--sur3);overflow:hidden;width:80px;flex-shrink:0}
+.bar-track.full{flex:1}
+.bar-fill{height:100%;border-radius:3px;transition:width 1s}
+.bar-green{background:var(--green)}.bar-amber{background:var(--amber)}.bar-red{background:var(--red)}.bar-blue{background:var(--blue)}
+.prog-wrap{display:flex;align-items:center;gap:8px}
+
+/* ── WORKER AVATAR ────────────────── */
+.wa-wrap{display:flex;align-items:center;gap:8px}
+.wa{width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:11px;color:#fff;flex-shrink:0}
+
+/* ── TIMERS ───────────────────────── */
+.timer-card{background:var(--sur2);border:1.5px solid var(--br);border-radius:12px;padding:18px;
+  display:flex;flex-direction:column;gap:10px}
+.timer-label{font-size:12px;font-weight:600;color:var(--txt2)}
+.timer-display{font-family:'JetBrains Mono',monospace;font-size:32px;font-weight:600;color:var(--blue)}
+.timer-btns{display:flex;gap:8px}
+
+/* ── MINI LIST (dashboard) ────────── */
+.mini-row{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--br)}
+.mini-row:last-child{border-bottom:none}
+.dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.dot-green{background:var(--green)}.dot-amber{background:var(--amber)}.dot-red{background:var(--red);animation:pulse 1s infinite}
+.mini-id{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--txt2);flex-shrink:0;width:44px}
+.mini-name{font-size:13px;color:var(--txt);flex:1}
+.pct-g{color:var(--green);font-weight:700;font-size:12px}
+.pct-a{color:var(--amber);font-weight:700;font-size:12px}
+.pct-r{color:var(--red);font-weight:700;font-size:12px}
+.empty-state{color:var(--txt3);font-size:13px;padding:16px;text-align:center;font-style:italic}
+
+/* ── UTILS ────────────────────────── */
+.mono{font-family:'JetBrains Mono',monospace}
+.grey{color:var(--txt2)}.fw6{font-weight:600}.fw7{font-weight:700}
+.sm{font-size:12px}.mt4{margin-top:4px}.mt16{margin-top:16px}
+
+/* ── TOAST ─────────────────────────── */
+#toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:10px}
+.toast{background:#1e293b;color:#e2e8f0;padding:12px 18px;border-radius:10px;font-size:13px;font-weight:500;
+  max-width:320px;box-shadow:0 8px 24px rgba(0,0,0,.25);opacity:0;transform:translateY(10px);transition:all .35s ease;
+  border-left:4px solid var(--blue)}
+.toast.toast-sales{border-left-color:var(--green)}
+.toast.toast-logistics{border-left-color:var(--blue)}
+.toast.toast-show{opacity:1;transform:translateY(0)}
+
+/* ── SALES CHART ───────────────────── */
+.chart-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.chart-stat{background:var(--sur2);border:1.5px solid var(--br);border-radius:10px;padding:12px 14px}
+.cs-lbl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px}
+.cs-val{font-size:18px;font-weight:800}
+.cs-green .cs-lbl{color:var(--green)}.cs-green .cs-val{color:var(--green)}
+.cs-amber .cs-lbl{color:var(--amber)}.cs-amber .cs-val{color:var(--amber)}
+.cs-red .cs-lbl{color:var(--red)}.cs-red .cs-val{color:var(--red)}
+.cs-blue .cs-lbl{color:var(--blue)}.cs-blue .cs-val{color:var(--blue)}
+.chart-area{background:var(--sur2);border:1.5px solid var(--br);border-radius:12px;padding:20px;position:relative}
+.chart-bars{display:flex;align-items:flex-end;gap:10px;height:160px;padding-bottom:28px}
+.chart-col{display:flex;flex-direction:column;align-items:center;flex:1;position:relative;cursor:pointer}
+.chart-bar{width:100%;background:linear-gradient(180deg,var(--blue) 0%,#93c5fd 100%);border-radius:6px 6px 0 0;
+  animation:growUp .5s ease both;transition:opacity .2s}
+.chart-col:hover .chart-bar{opacity:.8}
+.chart-col:hover .chart-tooltip{opacity:1;transform:translateY(-4px)}
+@keyframes growUp{from{height:0!important}to{}}
+.chart-lbl{position:absolute;bottom:0;font-size:10px;font-weight:600;color:var(--txt3);white-space:nowrap}
+.chart-tooltip{position:absolute;top:-32px;background:#1e293b;color:#fff;padding:4px 8px;border-radius:6px;
+  font-size:11px;font-weight:600;white-space:nowrap;opacity:0;transition:all .2s;pointer-events:none;z-index:10}
+.chart-live-badge{position:absolute;top:14px;right:14px;display:flex;align-items:center;gap:6px;
+  font-size:11px;font-weight:700;color:var(--green);letter-spacing:1px}
+.chart-empty{color:var(--txt3);text-align:center;padding:40px;font-style:italic;background:var(--sur2);border-radius:12px;border:1.5px dashed var(--br)}
+
+/* ── LOGISTICS TRACKER ─────────────── */
+.tracker-row{display:flex;align-items:center;margin-bottom:8px}
+.step{display:flex;flex-direction:column;align-items:center;gap:3px}
+.step-dot{width:12px;height:12px;border-radius:50%;background:var(--br2);transition:all .3s;flex-shrink:0}
+.step-lbl{font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--txt3);white-space:nowrap}
+.step-done .step-dot{background:var(--green)}
+.step-done .step-lbl{color:var(--green)}
+.step-active .step-dot{background:var(--blue);box-shadow:0 0 0 3px #dbeafe}
+.step-active .step-lbl{color:var(--blue);font-weight:700}
+.step-line{flex:1;height:2px;background:var(--br2);margin:0 4px;margin-bottom:14px;transition:background .3s;min-width:20px}
+.line-done{background:var(--green)}
+.status-btns{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+.sbtn{padding:3px 8px;border-radius:5px;border:1.5px solid var(--br2);background:transparent;
+  color:var(--txt2);font-size:10px;font-weight:600;cursor:pointer;transition:all .15s;font-family:'Plus Jakarta Sans',sans-serif}
+.sbtn:hover{background:var(--sur3)}
+.sbtn-active{background:#f1f5f9;border-color:var(--br2);color:var(--txt)}
+.sbtn-blue.sbtn-active{background:#dbeafe;border-color:#93c5fd;color:var(--blue)}
+.sbtn-green.sbtn-active{background:#dcfce7;border-color:#86efac;color:var(--green)}
+.sbtn-red{color:var(--red)}.sbtn-red.sbtn-active{background:#fee2e2;border-color:#fca5a5}
+</style>
+</head>
+<body>
+
+<!-- ══ LOGIN ══ -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-logo">Factory<span>OS</span></div>
+    <div class="login-sub">Production Management</div>
+    <div class="login-desc">Sign in with your Google account to access your private production workspace — machines, deliveries, sales, logistics, and more.</div>
+    <button id="signin-btn" onclick="signInGoogle()">
+      <svg width="20" height="20" viewBox="0 0 48 48">
+        <path fill="#EA4335" d="M24 9.5c3.5 0 6.5 1.2 8.9 3.2l6.6-6.6C35.2 2.5 29.9 0 24 0 14.7 0 6.7 5.4 2.8 13.3l7.7 6C12.3 13 17.7 9.5 24 9.5z"/>
+        <path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.6 3-2.3 5.5-4.8 7.2l7.5 5.8c4.4-4.1 7-10.1 7.1-17z"/>
+        <path fill="#FBBC05" d="M10.5 28.7A14.5 14.5 0 0 1 9.5 24c0-1.6.3-3.2.8-4.7l-7.7-6A23.9 23.9 0 0 0 0 24c0 3.9.9 7.5 2.6 10.7l7.9-6z"/>
+        <path fill="#34A853" d="M24 48c6 0 11-2 14.7-5.3l-7.5-5.8c-2 1.4-4.6 2.1-7.2 2.1-6.3 0-11.6-4.2-13.5-9.9l-7.9 6C6.7 42.6 14.7 48 24 48z"/>
+      </svg>
+      Sign in with Google
+    </button>
+    <div id="auth-error" style="display:none;margin-top:14px;padding:12px 14px;background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;color:#b91c1c;font-size:12px;line-height:1.6;text-align:left"></div>
+    <div class="login-note">🔒 Your data is private — each account has its own isolated workspace</div>
+    <div class="login-note" style="margin-top:6px;color:#94a3b8;font-size:11px">You will be redirected to Google to sign in, then brought back here.</div>
+    <div class="login-note" style="margin-top:8px;color:#94a3b8;font-size:11px">If a popup appears, allow it. If not, you'll be redirected to Google.</div>
+  </div>
+</div>
+
+<!-- ══ APP ══ -->
+<div class="shell" id="app" style="display:none">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="s-logo">
+      <div class="s-logo-text">Factory<span>OS</span></div>
+      <div class="s-logo-sub">Production Management</div>
+    </div>
+    <nav>
+      <div class="s-section">Overview</div>
+      <a class="nav-link active" data-tab="dashboard" onclick="switchTab('dashboard')"><span class="nav-ic">⬛</span>Dashboard</a>
+
+      <div class="s-section">Machines</div>
+      <a class="nav-link" data-tab="machines" onclick="switchTab('machines')"><span class="nav-ic">⚙</span>Machine Status</a>
+      <a class="nav-link" data-tab="timers" onclick="switchTab('timers')"><span class="nav-ic">◷</span>Time Tracker</a>
+      <a class="nav-link" data-tab="waste" onclick="switchTab('waste')"><span class="nav-ic">⚠</span>Waste Counter</a>
+      <a class="nav-link" data-tab="workers" onclick="switchTab('workers')"><span class="nav-ic">👥</span>Worker Records</a>
+
+      <div class="s-section">Production</div>
+      <a class="nav-link" data-tab="parts" onclick="switchTab('parts')"><span class="nav-ic">🔩</span>Part Progress</a>
+      <a class="nav-link" data-tab="mfgschedule" onclick="switchTab('mfgschedule')"><span class="nav-ic">📅</span>Mfg Schedule</a>
+      <a class="nav-link" data-tab="resources" onclick="switchTab('resources')"><span class="nav-ic">📦</span>Resource Planning</a>
+
+      <div class="s-section">Commerce</div>
+      <a class="nav-link" data-tab="sales" onclick="switchTab('sales')"><span class="nav-ic">💰</span>Total Sales</a>
+      <a class="nav-link" data-tab="deliveries" onclick="switchTab('deliveries')"><span class="nav-ic">🚚</span>Delivery Schedule</a>
+      <a class="nav-link" data-tab="logistics" onclick="switchTab('logistics')"><span class="nav-ic">🌐</span>Logistics</a>
+      <a class="nav-link" data-tab="customers" onclick="switchTab('customers')"><span class="nav-ic">🏢</span>Customers & Items</a>
+
+      <div class="s-section">Reports</div>
+      <a class="nav-link" data-tab="log" onclick="switchTab('log')"><span class="nav-ic">≡</span>Activity Log</a>
+    </nav>
+    <div class="s-bottom">
+      <div class="u-row">
+        <div id="u-av">?</div>
+        <div style="min-width:0">
+          <div id="u-name"></div>
+          <div id="u-email"></div>
+        </div>
+      </div>
+      <button class="btn-signout" onclick="signOutUser()">Sign out</button>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="topbar">
+      <div id="page-title">Dashboard</div>
+      <div class="topbar-right">
+        <div class="shift-chip">SHIFT A · LINE 3</div>
+        <div class="live-badge"><div class="live-dot"></div>LIVE</div>
+        <div id="clock">--:--:--</div>
+      </div>
+    </div>
+
+    <div class="content">
+
+      <!-- ══ DASHBOARD ══ -->
+      <div class="panel active" id="panel-dashboard">
+        <div class="kpi-grid">
+          <div class="kpi-card kpi-blue"><div class="kpi-label">Machines Running</div><div class="kpi-val" id="kpi-machines">—</div><div class="kpi-sub">Total registered</div></div>
+          <div class="kpi-card kpi-teal"><div class="kpi-label">Avg Uptime</div><div class="kpi-val" id="kpi-uptime">—</div><div class="kpi-sub">All machines</div></div>
+          <div class="kpi-card kpi-red"><div class="kpi-label">Waste Today</div><div class="kpi-val" id="kpi-waste">—</div><div class="kpi-sub">Units rejected</div></div>
+          <div class="kpi-card kpi-amber"><div class="kpi-label">Active Faults</div><div class="kpi-val" id="kpi-faults">—</div><div class="kpi-sub">Need attention</div></div>
+          <div class="kpi-card kpi-green"><div class="kpi-label">Total Sales</div><div class="kpi-val" id="kpi-sales" style="font-size:18px">—</div><div class="kpi-sub">All time</div></div>
+          <div class="kpi-card kpi-purple"><div class="kpi-label">Pending Deliveries</div><div class="kpi-val" id="kpi-deliveries">—</div><div class="kpi-sub">In transit / pending</div></div>
+        </div>
+        <div class="grid2">
+          <div class="card"><div class="card-header"><div class="card-title">Machine Health</div><div class="card-sub">Live status</div></div><div id="dash-machines"></div></div>
+          <div class="card"><div class="card-header"><div class="card-title">Recent Deliveries</div><div class="card-sub">Latest scheduled</div></div><div id="dash-deliveries"></div></div>
+        </div>
+        <div class="card"><div class="card-header"><div class="card-title">Recent Sales</div><div class="card-sub">Latest transactions</div></div><div id="dash-sales"></div></div>
+      </div>
+
+      <!-- ══ MACHINES ══ -->
+      <div class="panel" id="panel-machines">
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">All Machines</div>
+            <button class="btn btn-primary sm" onclick="toggleForm('form-machine')">+ Add Machine</button>
+          </div>
+          <div class="form-panel" id="form-machine" style="display:none">
+            <div class="form-grid">
+              <div class="fg"><label>Machine ID</label><input id="newMId" placeholder="e.g. M-06"/></div>
+              <div class="fg"><label>Machine Name</label><input id="newMName" placeholder="e.g. Press Unit Alpha"/></div>
+              <div class="fg"><label>Type</label><select id="newMType"><option>CNC Mill</option><option>Press</option><option>Lathe</option><option>Conveyor</option><option>Welder</option><option>Robot Arm</option><option>Drill</option></select></div>
+              <div class="fg"><label>Status</label><select id="newMStatus"><option>Running</option><option>Idle</option><option>Fault</option></select></div>
+              <div class="fg"><label>Assigned Operator</label><input id="newMOp" placeholder="Worker name"/></div>
+              <div class="fg"><label>Last Service Date</label><input type="date" id="newMSvc"/></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-machine')">Cancel</button><button class="btn btn-primary sm" onclick="addMachine()">Save Machine</button></div>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th>Uptime</th><th>Operator</th><th>Last Service</th><th>Actions</th></tr></thead><tbody id="machines-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ TIMERS ══ -->
+      <div class="panel" id="panel-timers">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Machine Timers</div><button class="btn btn-primary sm" onclick="addTimer()">+ New Timer</button></div>
+          <div class="grid3" id="timers-grid"></div>
+        </div>
+        <div class="card mt16">
+          <div class="card-header"><div class="card-title">Session Log</div><div class="card-sub">Saved to cloud</div></div>
+          <div class="tbl-wrap"><table><thead><tr><th>Machine</th><th>Operator</th><th>Start</th><th>End</th><th>Duration</th><th>Task</th></tr></thead><tbody id="session-log"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ WASTE ══ -->
+      <div class="panel" id="panel-waste">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Log Waste Event</div></div>
+          <div class="form-grid">
+            <div class="fg"><label>Machine</label><select id="wasteM"><option>M-01 — CNC Alpha</option><option>M-02 — Press Beta</option><option>M-03 — Conveyor C</option><option>M-04 — Lathe Gamma</option><option>M-05 — Welder Delta</option></select></div>
+            <div class="fg"><label>Quantity</label><input type="number" id="wasteQty" placeholder="0" min="1"/></div>
+            <div class="fg"><label>Cause</label><select id="wasteCause"><option>Dimensional Error</option><option>Surface Defect</option><option>Material Fault</option><option>Operator Error</option><option>Tool Wear</option><option>Other</option></select></div>
+            <div class="fg"><label>Severity</label><select id="wasteSev"><option>High</option><option>Medium</option><option>Low</option></select></div>
+            <div class="fg full"><label>Notes</label><textarea id="wasteNotes" placeholder="Optional details…"></textarea></div>
+          </div>
+          <div class="form-actions"><button class="btn btn-primary" onclick="logWaste()">Log Waste</button></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><div class="card-title">Waste Records</div></div>
+          <div class="tbl-wrap"><table><thead><tr><th>#</th><th>Time</th><th>Machine</th><th>Qty</th><th>Cause</th><th>Severity</th><th>Notes</th></tr></thead><tbody id="waste-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ WORKERS ══ -->
+      <div class="panel" id="panel-workers">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Log Worker Activity</div></div>
+          <div class="form-grid">
+            <div class="fg"><label>Worker Name</label><input id="wkName" placeholder="Full name"/></div>
+            <div class="fg"><label>Worker ID</label><input id="wkId" placeholder="e.g. W-042"/></div>
+            <div class="fg"><label>Machine</label><select id="wkMachine"><option>M-01 — CNC Alpha</option><option>M-02 — Press Beta</option><option>M-03 — Conveyor C</option><option>M-04 — Lathe Gamma</option><option>M-05 — Welder Delta</option></select></div>
+            <div class="fg"><label>Shift</label><select id="wkShift"><option>Shift A (06:00–14:00)</option><option>Shift B (14:00–22:00)</option><option>Shift C (22:00–06:00)</option></select></div>
+            <div class="fg"><label>Units Produced</label><input type="number" id="wkUnits" placeholder="0"/></div>
+            <div class="fg"><label>Status</label><select id="wkStatus"><option>Active</option><option>Break</option><option>Absent</option></select></div>
+            <div class="fg full"><label>Notes</label><textarea id="wkNotes" placeholder="Performance notes…"></textarea></div>
+          </div>
+          <div class="form-actions"><button class="btn btn-primary" onclick="addWorker()">Save Record</button></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><div class="card-title">Worker Records</div></div>
+          <div class="tbl-wrap"><table><thead><tr><th>Worker</th><th>ID</th><th>Machine</th><th>Shift</th><th>Units</th><th>Efficiency</th><th>Status</th><th>Notes</th></tr></thead><tbody id="workers-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ DELIVERIES ══ -->
+      <div class="panel" id="panel-deliveries">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Delivery Schedule</div><button class="btn btn-primary sm" onclick="toggleForm('form-delivery')">+ Add Delivery</button></div>
+          <div class="form-panel" id="form-delivery" style="display:none">
+            <div class="form-grid">
+              <div class="fg"><label>Customer Name</label><input id="delCustomer" placeholder="Customer name"/></div>
+              <div class="fg"><label>Items / Order</label><input id="delItems" placeholder="e.g. 100x Part A"/></div>
+              <div class="fg"><label>Scheduled Date</label><input type="date" id="delDate"/></div>
+              <div class="fg"><label>ETA</label><input type="date" id="delEta"/></div>
+              <div class="fg"><label>Status</label><select id="delStatus"><option>Pending</option><option>In Transit</option><option>Delivered</option><option>Delayed</option></select></div>
+              <div class="fg"><label>Driver / Courier</label><input id="delDriver" placeholder="Driver name or company"/></div>
+              <div class="fg full"><label>Notes</label><textarea id="delNotes" placeholder="Delivery instructions, address notes…"></textarea></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-delivery')">Cancel</button><button class="btn btn-primary sm" onclick="addDelivery()">Save Delivery</button></div>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr><th>Customer</th><th>Items</th><th>Date</th><th>ETA</th><th>Status</th><th>Driver</th><th>Notes</th></tr></thead><tbody id="del-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ PARTS ══ -->
+      <div class="panel" id="panel-parts">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Part Progress Tracker</div><button class="btn btn-primary sm" onclick="toggleForm('form-parts')">+ Add Part</button></div>
+          <div class="form-panel" id="form-parts" style="display:none">
+            <div class="form-grid">
+              <div class="fg"><label>Part Name</label><input id="partName" placeholder="e.g. Shaft Assembly"/></div>
+              <div class="fg"><label>Part No.</label><input id="partNo" placeholder="e.g. PT-0042"/></div>
+              <div class="fg"><label>Machine</label><input id="partMachine" placeholder="e.g. M-01"/></div>
+              <div class="fg"><label>Total Required</label><input type="number" id="partTotal" placeholder="100"/></div>
+              <div class="fg"><label>Completed</label><input type="number" id="partDone" placeholder="0"/></div>
+              <div class="fg"><label>Status</label><select id="partStatus"><option>In Progress</option><option>Pending</option><option>Complete</option><option>On Hold</option></select></div>
+              <div class="fg"><label>Due Date</label><input type="date" id="partDue"/></div>
+              <div class="fg"><label>Notes</label><input id="partNotes" placeholder="Optional notes"/></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-parts')">Cancel</button><button class="btn btn-primary sm" onclick="addPart()">Save Part</button></div>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr><th>Part Name</th><th>Part No.</th><th>Machine</th><th>Progress</th><th>Status</th><th>Due Date</th><th>Notes</th></tr></thead><tbody id="parts-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ SALES ══ -->
+      <div class="panel" id="panel-sales">
+        <div class="card">
+          <div class="card-header">
+            <div><div class="card-title">Sales Records</div><div class="card-sub" id="sales-total" style="margin-top:4px;font-weight:700;color:var(--green)">Total: RM 0.00</div></div>
+            <button class="btn btn-primary sm" onclick="toggleForm('form-sales')">+ Add Sale</button>
+          </div>
+          <div class="form-panel" id="form-sales" style="display:none">
+            <div class="form-grid3">
+              <div class="fg"><label>Invoice No.</label><input id="saleInv" placeholder="INV-0001"/></div>
+              <div class="fg"><label>Customer</label><input id="saleCustomer" placeholder="Customer name"/></div>
+              <div class="fg"><label>Item / Product</label><input id="saleItem" placeholder="Item description"/></div>
+              <div class="fg"><label>Quantity</label><input type="number" id="saleQty" placeholder="1"/></div>
+              <div class="fg"><label>Amount (RM)</label><input type="number" step="0.01" id="saleAmount" placeholder="0.00"/></div>
+              <div class="fg"><label>Status</label><select id="saleStatus"><option>Paid</option><option>Pending</option><option>Overdue</option></select></div>
+              <div class="fg"><label>Date</label><input type="date" id="saleDate"/></div>
+              <div class="fg full"><label>Notes</label><textarea id="saleNotes" placeholder="Optional notes…" style="min-height:50px"></textarea></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-sales')">Cancel</button><button class="btn btn-primary sm" onclick="addSale()">Save Sale</button></div>
+          </div>
+          <div id="sales-chart" style="margin-bottom:18px"><div class="chart-empty">Loading chart…</div></div>
+          <div class="tbl-wrap"><table><thead><tr><th>Invoice</th><th>Customer</th><th>Item</th><th>Qty</th><th>Amount</th><th>Status</th><th>Date</th><th>Notes</th></tr></thead><tbody id="sales-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ LOGISTICS ══ -->
+      <div class="panel" id="panel-logistics">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Logistics & Shipments</div><button class="btn btn-primary sm" onclick="toggleForm('form-logistics')">+ Add Shipment</button></div>
+          <div class="form-panel" id="form-logistics" style="display:none">
+            <div class="form-grid3">
+              <div class="fg"><label>Reference No.</label><input id="logRef" placeholder="e.g. SHP-001"/></div>
+              <div class="fg"><label>Carrier</label><input id="logCarrier" placeholder="e.g. Pos Laju, DHL"/></div>
+              <div class="fg"><label>Tracking No.</label><input id="logTracking" placeholder="Tracking number"/></div>
+              <div class="fg"><label>Origin</label><input id="logOrigin" placeholder="e.g. Kuala Lumpur"/></div>
+              <div class="fg"><label>Destination</label><input id="logDest" placeholder="e.g. Johor Bahru"/></div>
+              <div class="fg"><label>Status</label><select id="logStatus"><option>Pending</option><option>In Transit</option><option>Delivered</option><option>Delayed</option></select></div>
+              <div class="fg"><label>Departure Date</label><input type="date" id="logDep"/></div>
+              <div class="fg"><label>Arrival Date</label><input type="date" id="logArr"/></div>
+              <div class="fg"><label>Weight (kg)</label><input type="number" id="logWeight" placeholder="0"/></div>
+              <div class="fg full"><label>Notes</label><textarea id="logNotes" placeholder="Special instructions…" style="min-height:50px"></textarea></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-logistics')">Cancel</button><button class="btn btn-primary sm" onclick="addLogistic()">Save Shipment</button></div>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr><th>Ref No.</th><th>Carrier</th><th>Origin</th><th>Destination</th><th>Status</th><th>Departure</th><th>Arrival</th><th>Weight</th><th>Tracking</th></tr></thead><tbody id="log-tbody2"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ CUSTOMERS ══ -->
+      <div class="panel" id="panel-customers">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Customer Directory & Item Details</div><button class="btn btn-primary sm" onclick="toggleForm('form-customer')">+ Add Customer</button></div>
+          <div class="form-panel" id="form-customer" style="display:none">
+            <div class="form-grid">
+              <div class="fg"><label>Contact Name</label><input id="custName" placeholder="Full name"/></div>
+              <div class="fg"><label>Company</label><input id="custCompany" placeholder="Company name"/></div>
+              <div class="fg full"><label>Address</label><input id="custAddress" placeholder="Full address"/></div>
+              <div class="fg"><label>City</label><input id="custCity" placeholder="e.g. Kuala Lumpur"/></div>
+              <div class="fg"><label>Phone</label><input id="custPhone" placeholder="+60 12-345 6789"/></div>
+              <div class="fg"><label>Email</label><input type="email" id="custEmail" placeholder="email@company.com"/></div>
+              <div class="fg full"><label>Items / Products Ordered</label><textarea id="custItems" placeholder="List items this customer regularly orders…"></textarea></div>
+              <div class="fg full"><label>Notes</label><textarea id="custNotes" placeholder="Special requirements, preferences…" style="min-height:50px"></textarea></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-customer')">Cancel</button><button class="btn btn-primary sm" onclick="addCustomer()">Save Customer</button></div>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Company</th><th>Address</th><th>City</th><th>Phone</th><th>Email</th><th>Items</th><th>Notes</th></tr></thead><tbody id="cust-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ RESOURCES ══ -->
+      <div class="panel" id="panel-resources">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Resource Planning</div><button class="btn btn-primary sm" onclick="toggleForm('form-resource')">+ Add Resource</button></div>
+          <div class="form-panel" id="form-resource" style="display:none">
+            <div class="form-grid">
+              <div class="fg"><label>Resource Name</label><input id="resName" placeholder="e.g. Steel Rod Grade A"/></div>
+              <div class="fg"><label>Type</label><select id="resType"><option>Raw Material</option><option>Tool</option><option>Component</option><option>Consumable</option><option>Equipment</option></select></div>
+              <div class="fg"><label>Total Stock</label><input type="number" id="resTotal" placeholder="100"/></div>
+              <div class="fg"><label>Available</label><input type="number" id="resAvail" placeholder="0"/></div>
+              <div class="fg"><label>Unit</label><input id="resUnit" placeholder="e.g. kg, pcs, m"/></div>
+              <div class="fg"><label>Status</label><select id="resStatus"><option>Available</option><option>Low Stock</option><option>Out of Stock</option></select></div>
+              <div class="fg"><label>Supplier</label><input id="resSupplier" placeholder="Supplier name"/></div>
+              <div class="fg"><label>Reorder At</label><input type="number" id="resReorder" placeholder="Min qty to reorder"/></div>
+              <div class="fg full"><label>Notes</label><textarea id="resNotes" placeholder="Storage location, specs…" style="min-height:50px"></textarea></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-resource')">Cancel</button><button class="btn btn-primary sm" onclick="addResource()">Save Resource</button></div>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr><th>Resource</th><th>Type</th><th>Stock Level</th><th>Status</th><th>Supplier</th><th>Reorder At</th><th>Notes</th></tr></thead><tbody id="res-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ MFG SCHEDULE ══ -->
+      <div class="panel" id="panel-mfgschedule">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Manufacturing Schedule</div><button class="btn btn-primary sm" onclick="toggleForm('form-mfg')">+ Schedule Job</button></div>
+          <div class="form-panel" id="form-mfg" style="display:none">
+            <div class="form-grid3">
+              <div class="fg"><label>Job Name</label><input id="mfgJob" placeholder="e.g. Shaft Batch #80"/></div>
+              <div class="fg"><label>Job No.</label><input id="mfgNo" placeholder="e.g. JOB-080"/></div>
+              <div class="fg"><label>Machine</label><input id="mfgMachine" placeholder="e.g. M-01"/></div>
+              <div class="fg"><label>Operator</label><input id="mfgOp" placeholder="Worker name"/></div>
+              <div class="fg"><label>Start Date</label><input type="date" id="mfgStart"/></div>
+              <div class="fg"><label>End Date</label><input type="date" id="mfgEnd"/></div>
+              <div class="fg"><label>Shift</label><select id="mfgShift"><option>Shift A</option><option>Shift B</option><option>Shift C</option><option>All Shifts</option></select></div>
+              <div class="fg"><label>Priority</label><select id="mfgPriority"><option>High</option><option>Medium</option><option>Low</option></select></div>
+              <div class="fg"><label>Status</label><select id="mfgStatus"><option>Scheduled</option><option>In Progress</option><option>Complete</option><option>Delayed</option><option>On Hold</option></select></div>
+              <div class="fg"><label>Target Qty</label><input type="number" id="mfgQty" placeholder="0"/></div>
+              <div class="fg full"><label>Notes</label><textarea id="mfgNotes" placeholder="Instructions, specs…" style="min-height:50px"></textarea></div>
+            </div>
+            <div class="form-actions"><button class="btn btn-ghost sm" onclick="hide('form-mfg')">Cancel</button><button class="btn btn-primary sm" onclick="addMfgSched()">Schedule Job</button></div>
+          </div>
+          <div class="tbl-wrap"><table><thead><tr><th>Job No.</th><th>Job Name</th><th>Machine</th><th>Operator</th><th>Start</th><th>End</th><th>Shift</th><th>Priority</th><th>Status</th><th>Qty</th><th>Notes</th></tr></thead><tbody id="mfg-tbody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- ══ LOG ══ -->
+      <div class="panel" id="panel-log">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Activity Log</div><div class="card-sub" id="log-count">0 events</div></div>
+          <div class="tbl-wrap"><table><thead><tr><th>Time</th><th>Type</th><th>Description</th><th>User</th></tr></thead><tbody id="log-tbody3"></tbody></table></div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /shell -->
+
+</body>
+</html>
